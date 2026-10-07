@@ -40,20 +40,21 @@ jobs:
           charm_name=$(yq -r '.name' charmcraft.yaml)
 
           # Latest uploaded revisions of the resource, as JSON
-          revisions=$(charmcraft resource-revisions "$charm_name" demo-server-image --format json)
+          revisions=$(charmcraft resource-revisions "$charm_name" "$RESOURCE_NAME" --format json)
 
           # Highest revision number, empty if none has been uploaded
           rev=$(echo "$revisions" | jq -r 'map(.revision) | max // empty')
 
           # Fail if the resource has no revision: the charm can't be released without it
           if [ -z "$rev" ]; then
-            echo "No revision found for resource 'demo-server-image'. Upload one with 'charmcraft upload-resource' first."
+            echo "No revision found for resource '$RESOURCE_NAME'. Upload one with 'charmcraft upload-resource' first."
             exit 1
           fi
-          echo "Using demo-server-image revision $rev"
+          echo "Using $RESOURCE_NAME revision $rev"
 
           for charm in *.charm; do
-            charmcraft upload "$charm" --release latest/edge --resource demo-server-image:"$rev"
+            charmcraft upload "$charm" --release latest/edge --resource "$RESOURCE_NAME":"$rev"
           done
         env:
           CHARMCRAFT_AUTH: ${{ secrets.CHARMHUB_TOKEN }}
+          RESOURCE_NAME: demo-server-image
