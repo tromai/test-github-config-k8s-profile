@@ -7,7 +7,7 @@ import ops
 import pytest
 from ops import testing
 
-from charm import API_TOKEN_LABEL, APP_SECRET_LABEL, SERVICE_NAME, BooCharm
+from charm import API_TOKEN_LABEL, APP_SECRET_LABEL, SERVICE_NAME, BooCharm, proxy_environment
 
 CHECK_NAME = "service-ready"  # Name of Pebble check in the mock workload container.
 
@@ -206,6 +206,7 @@ def test_config_changed_with_api_token():
         owner=None,  # user-owned secret (not app- or unit-owned)
     )
     state_in = testing.State(
+        containers={testing.Container("some-container")},
         secrets={secret},
         config={"api-token": secret.id},
     )
@@ -222,6 +223,7 @@ def test_config_changed_api_token_not_found():
     # Arrange:
     ctx = testing.Context(BooCharm)
     state_in = testing.State(
+        containers={testing.Container("some-container")},
         config={"api-token": "secret:doesnotexist00000000"},
         # No matching secret in state — simulates the secret not being granted.
     )
@@ -242,6 +244,7 @@ def test_config_changed_api_token_missing_key():
         owner=None,  # user-owned secret (not app- or unit-owned)
     )
     state_in = testing.State(
+        containers={testing.Container("some-container")},
         secrets={secret},
         config={"api-token": secret.id},
     )
@@ -257,7 +260,7 @@ def test_config_changed_no_token():
     """Test that config-changed without api-token set does nothing."""
     # Arrange:
     ctx = testing.Context(BooCharm)
-    state_in = testing.State()
+    state_in = testing.State(containers={testing.Container("some-container")})
 
     # Act:
     state_out = ctx.run(ctx.on.config_changed(), state_in)
@@ -347,3 +350,172 @@ def test_secret_remove():
 
     # Assert — the charm asked Juju to remove that revision:
     assert ctx.removed_secret_revisions == [2]
+
+
+def make_proxy_state(container: testing.Container) -> testing.State:
+    """Build a state in which the model has proxy settings (like 'juju model-config')."""
+    proxy_config = testing.ProxyConfig(
+        http_proxy="http://squid.internal:3128",
+        https_proxy="http://squid.internal:3129",
+        no_proxy="127.0.0.1,localhost,::1,10.0.0.0/8",
+    )
+    return testing.State(
+        containers={container},
+        model=testing.Model(proxy_config=proxy_config),
+    )
+
+
+# What the workload should see for the settings in make_proxy_state:
+EXPECTED_PROXY_ENVIRONMENT = {
+    "HTTP_PROXY": "http://squid.internal:3128",
+    "http_proxy": "http://squid.internal:3128",
+    "HTTPS_PROXY": "http://squid.internal:3129",
+    "https_proxy": "http://squid.internal:3129",
+    "NO_PROXY": "127.0.0.1,localhost,::1,10.0.0.0/8",
+    "no_proxy": "127.0.0.1,localhost,::1,10.0.0.0/8",
+}
+
+
+def get_service_environment(state: testing.State) -> dict[str, str]:
+    """Get the environment that Pebble will give the workload's service."""
+    container = state.get_container("some-container")
+    return dict(container.plan.services[SERVICE_NAME].environment)
+
+
+def test_proxy_environment():
+    """Test that all of the model's proxy settings become upper- and lower-case variables."""
+    proxy = ops.ProxyConfig(
+        http_proxy="http://a:1",
+        https_proxy="http://b:2",
+        ftp_proxy="http://c:3",
+        no_proxy="localhost",
+    )
+    assert proxy_environment(proxy) == {
+        "HTTP_PROXY": "http://a:1",
+        "http_proxy": "http://a:1",
+        "HTTPS_PROXY": "http://b:2",
+        "https_proxy": "http://b:2",
+        "FTP_PROXY": "http://c:3",
+        "ftp_proxy": "http://c:3",
+        "NO_PROXY": "localhost",
+        "no_proxy": "localhost",
+    }
+
+
+def test_proxy_environment_omits_missing_settings():
+    """Test that settings that the model doesn't provide are left out."""
+    assert proxy_environment(ops.ProxyConfig()) == {}
+    assert proxy_environment(ops.ProxyConfig(https_proxy="http://b:2")) == {
+        "HTTPS_PROXY": "http://b:2",
+        "https_proxy": "http://b:2",
+    }
+
+
+def test_pebble_ready_passes_proxy_settings_to_workload(monkeypatch: pytest.MonkeyPatch):
+    """Test that the Pebble layer gives the workload the model's proxy settings."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container_in = make_container(ops.pebble.CheckStatus.UP)
+    monkeypatch.setattr("charm.boo.get_version", mock_get_version)
+
+    # Act:
+    state_out = ctx.run(ctx.on.pebble_ready(container_in), make_proxy_state(container_in))
+
+    # Assert:
+    assert get_service_environment(state_out) == EXPECTED_PROXY_ENVIRONMENT
+    assert state_out.unit_status == testing.ActiveStatus()
+
+
+def test_pebble_ready_without_proxy_settings(monkeypatch: pytest.MonkeyPatch):
+    """Test that the workload gets no proxy variables if the model has no proxy settings."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container_in = make_container(ops.pebble.CheckStatus.UP)
+    monkeypatch.setattr("charm.boo.get_version", mock_get_version)
+
+    # Act:
+    state_out = ctx.run(
+        ctx.on.pebble_ready(container_in), testing.State(containers={container_in})
+    )
+
+    # Assert:
+    assert get_service_environment(state_out) == {}
+
+
+def test_config_changed_updates_proxy_settings():
+    """Test that config-changed applies proxy settings that changed after the workload started."""
+    # Arrange — the workload is running without proxy settings:
+    ctx = testing.Context(BooCharm)
+    container_in = make_container(ops.pebble.CheckStatus.UP)
+
+    # Act:
+    state_out = ctx.run(ctx.on.config_changed(), make_proxy_state(container_in))
+
+    # Assert:
+    assert get_service_environment(state_out) == EXPECTED_PROXY_ENVIRONMENT
+    container_out = state_out.get_container(container_in.name)
+    assert container_out.service_statuses[SERVICE_NAME] == ops.pebble.ServiceStatus.ACTIVE
+
+
+def test_config_changed_removes_stale_proxy_settings():
+    """Test that config-changed removes settings that the model no longer provides."""
+    # Arrange — the workload is running with proxy settings that the model no longer has:
+    ctx = testing.Context(BooCharm)
+    stale_layer = ops.pebble.Layer(MOCK_LAYER.to_dict())
+    stale_layer.services[SERVICE_NAME].environment = {"HTTP_PROXY": "http://stale.internal:3128"}
+    check_in = testing.CheckInfo(
+        CHECK_NAME, level=ops.pebble.CheckLevel.READY, status=ops.pebble.CheckStatus.UP
+    )
+    container_in = testing.Container(
+        "some-container",
+        can_connect=True,
+        layers={"base": stale_layer},
+        service_statuses={SERVICE_NAME: ops.pebble.ServiceStatus.ACTIVE},
+        check_infos={check_in},
+    )
+
+    # Act:
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(containers={container_in}))
+
+    # Assert:
+    assert get_service_environment(state_out) == {}
+
+
+def test_upgrade_charm_updates_proxy_settings():
+    """Test that upgrade-charm applies the model's current proxy settings."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container_in = make_container(ops.pebble.CheckStatus.UP)
+
+    # Act:
+    state_out = ctx.run(ctx.on.upgrade_charm(), make_proxy_state(container_in))
+
+    # Assert:
+    assert get_service_environment(state_out) == EXPECTED_PROXY_ENVIRONMENT
+
+
+def test_config_changed_container_not_ready():
+    """Test that config-changed leaves the workload alone while Pebble isn't ready."""
+    # Arrange — pebble-ready will apply the proxy settings later:
+    ctx = testing.Context(BooCharm)
+    container_in = testing.Container("some-container", can_connect=False)
+
+    # Act:
+    state_out = ctx.run(ctx.on.config_changed(), make_proxy_state(container_in))
+
+    # Assert:
+    assert not state_out.get_container(container_in.name).layers
+    assert not isinstance(state_out.unit_status, testing.BlockedStatus)
+
+
+def test_proxy_settings_are_visible_in_the_charm():
+    """Test that the charm reads the settings from the model."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container_in = testing.Container("some-container", can_connect=False)
+
+    # Act and assert:
+    with ctx(ctx.on.config_changed(), make_proxy_state(container_in)) as manager:
+        assert manager.charm.model.proxy_config.https_proxy == "http://squid.internal:3129"
+        assert manager.charm.model.proxy_config.ftp_proxy is None
+        manager.run()

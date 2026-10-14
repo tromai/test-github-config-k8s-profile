@@ -26,12 +26,34 @@ API_TOKEN_LABEL = "api-token"  # Any label works; matching the config option nam
 APP_SECRET_LABEL = "workload-password"
 
 
+def proxy_environment(proxy: ops.ProxyConfig) -> dict[str, str]:
+    """Convert the model's proxy settings to environment variables for the workload.
+
+    Tools disagree on the case of the variable names (curl only honours the lower-case
+    'http_proxy', for example), so each setting is provided in both cases. Settings that the
+    model doesn't provide are left out.
+    """
+    settings = {
+        "HTTP_PROXY": proxy.http_proxy,
+        "HTTPS_PROXY": proxy.https_proxy,
+        "FTP_PROXY": proxy.ftp_proxy,
+        "NO_PROXY": proxy.no_proxy,
+    }
+    environment: dict[str, str] = {}
+    for name, value in settings.items():
+        if value:
+            environment[name] = value
+            environment[name.lower()] = value
+    return environment
+
+
 class BooCharm(ops.CharmBase):
     """Charm the application."""
 
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
         framework.observe(self.on["some_container"].pebble_ready, self._on_pebble_ready)
+        framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
         framework.observe(self.on["restart"].action, self._on_restart_action)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.secret_changed, self._on_secret_changed)
@@ -40,29 +62,41 @@ class BooCharm(ops.CharmBase):
         framework.observe(self.on.secret_remove, self._on_secret_remove)
         self.container = self.unit.get_container("some-container")
 
-    def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
-        """Handle pebble-ready event."""
-        self.unit.status = ops.MaintenanceStatus("starting workload")
-        # To start the workload, we'll add a Pebble layer to the workload container.
+    def _build_layer(self) -> ops.pebble.LayerDict:
+        """Build the Pebble layer that runs the workload."""
         # The layer specifies which service to run.
         # The charm expects the service to have a long-running command. Don't use a command that
         # starts the workload as a daemon then exits, otherwise Pebble either reports the service
         # as stopped (if the command exits quickly) or keeps restarting the service.
-        layer: ops.pebble.LayerDict = {
+        return {
             "services": {
                 SERVICE_NAME: {
                     "override": "replace",
                     "summary": "A service that runs in the workload container",
                     "command": "sleep infinity",  # Change this!
                     "startup": "enabled",
+                    # Pass the model's proxy settings (the 'juju-*-proxy' model config) to the
+                    # workload. Because the layer replaces the service, a setting that the model
+                    # no longer provides disappears from the service's environment.
+                    "environment": proxy_environment(self.model.proxy_config),
                 }
             }
         }
-        self.container.add_layer("base", layer, combine=True)
+
+    def _update_workload(self) -> None:
+        """Add the Pebble layer to the workload container and apply any changes."""
+        self.container.add_layer("base", self._build_layer(), combine=True)
         # If the container image is a rock, the container already has a Pebble layer.
         # In this case, you could remove 'add_layer' or use 'add_layer' to extend the rock's layer.
         # To learn about rocks, see https://documentation.ubuntu.com/rockcraft/en/stable/
-        self.container.replan()  # Starts the service (because 'startup' is enabled in the layer).
+        # 'replan' starts the service (because 'startup' is enabled in the layer). If the service
+        # is already running, 'replan' restarts it only if the layer changed.
+        self.container.replan()
+
+    def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
+        """Handle pebble-ready event."""
+        self.unit.status = ops.MaintenanceStatus("starting workload")
+        self._update_workload()
         self.wait_for_ready()
         version = boo.get_version()
         if version is not None:
@@ -77,6 +111,20 @@ class BooCharm(ops.CharmBase):
         # 'get_content' to read the latest revision. This charm doesn't demonstrate that; see
         # https://canonical.com/juju/docs/ops/latest/howto/manage-secrets/
         self.unit.status = ops.ActiveStatus()
+
+    def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent):
+        """Handle upgrade-charm event — the model's proxy settings might have changed."""
+        self._update_workload_if_connected()
+
+    def _update_workload_if_connected(self) -> None:
+        """Apply the model's current proxy settings, if the workload container is up."""
+        # Juju doesn't emit an event when the 'juju-*-proxy' model config changes, so call this
+        # from every handler that might run after such a change. If Pebble isn't ready yet, the
+        # pebble-ready handler applies the settings.
+        if not self.container.can_connect():
+            return
+        self._update_workload()
+        self.wait_for_ready()
 
     def _on_restart_action(self, event: ops.ActionEvent):
         """Handle the restart action."""
@@ -95,6 +143,7 @@ class BooCharm(ops.CharmBase):
 
     def _on_config_changed(self, event: ops.ConfigChangedEvent):
         """Handle config-changed event — api-token might now hold a different secret's ID."""
+        self._update_workload_if_connected()
         self._configure_api_token()
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent):

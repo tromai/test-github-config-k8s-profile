@@ -68,6 +68,59 @@ def test_user_secret(charm: pathlib.Path, juju: jubilant.Juju):
     juju.wait(jubilant.all_active)
 
 
+def get_service_environment(juju: jubilant.Juju) -> dict[str, str]:
+    """Get the environment of the workload's Pebble service from the Pebble plan."""
+    plan = yaml.safe_load(
+        juju.ssh("boo/0", "/charm/bin/pebble", "plan", container="some-container")
+    )
+    return plan["services"]["some-service"].get("environment", {})
+
+
+def wait_for_settled(juju: jubilant.Juju) -> None:
+    """Wait for the charm to be active and to have finished handling events."""
+    juju.wait(lambda status: jubilant.all_active(status) and jubilant.all_agents_idle(status))
+
+
+def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
+    """Test that the charm gives the workload the model's proxy settings."""
+    # Juju emits no event when 'juju-*-proxy' model config changes. The charm picks up the new
+    # settings the next time that it handles an event, so trigger config-changed by changing a
+    # charm config option.
+    juju.model_config(
+        {
+            "juju-http-proxy": "http://squid.internal:3128",
+            "juju-https-proxy": "http://squid.internal:3129",
+            "juju-no-proxy": "127.0.0.1,localhost,::1,10.0.0.0/8",
+        }
+    )
+    try:
+        juju.config("boo", {"log-level": "debug"})
+        wait_for_settled(juju)
+
+        environment = get_service_environment(juju)
+        assert environment["HTTP_PROXY"] == "http://squid.internal:3128"
+        assert environment["http_proxy"] == "http://squid.internal:3128"
+        assert environment["HTTPS_PROXY"] == "http://squid.internal:3129"
+        assert environment["https_proxy"] == "http://squid.internal:3129"
+        assert environment["NO_PROXY"] == "127.0.0.1,localhost,::1,10.0.0.0/8"
+        assert environment["no_proxy"] == "127.0.0.1,localhost,::1,10.0.0.0/8"
+        # The model has no FTP proxy.
+        assert "FTP_PROXY" not in environment
+    finally:
+        # Clean up: restore the defaults so that subsequent tests start clean.
+        juju.model_config(reset=["juju-http-proxy", "juju-https-proxy", "juju-no-proxy"])
+        juju.config("boo", reset=["log-level"])
+        wait_for_settled(juju)
+
+    # Without the model's proxy settings, the charm must remove the variables that it set before.
+    # (The model's no-proxy setting has a default value, so NO_PROXY remains.)
+    environment = get_service_environment(juju)
+    assert "HTTP_PROXY" not in environment
+    assert "HTTPS_PROXY" not in environment
+    assert "http_proxy" not in environment
+    assert "https_proxy" not in environment
+
+
 # If you implement boo.get_version in the charm source,
 # remove the @pytest.mark.skip line to enable this test.
 # Alternatively, remove this test if you don't need it.
