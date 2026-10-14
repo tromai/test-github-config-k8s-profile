@@ -9,6 +9,8 @@
 
 import logging
 import pathlib
+import time
+from collections.abc import Callable
 
 import jubilant
 import pytest
@@ -76,9 +78,25 @@ def get_service_environment(juju: jubilant.Juju) -> dict[str, str]:
     return plan["services"]["some-service"].get("environment", {})
 
 
-def wait_for_settled(juju: jubilant.Juju) -> None:
-    """Wait for the charm to be active and to have finished handling events."""
-    juju.wait(lambda status: jubilant.all_active(status) and jubilant.all_agents_idle(status))
+def wait_for_service_environment(
+    juju: jubilant.Juju,
+    condition: Callable[[dict[str, str]], bool],
+    timeout: float = 120,
+) -> dict[str, str]:
+    """Wait until the service's environment satisfies the condition, and return it.
+
+    'juju.wait' can return before Juju has queued the config-changed hook (the unit is still
+    active and idle), so check the result of the hook rather than the unit's status.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        juju.wait(lambda status: jubilant.all_active(status) and jubilant.all_agents_idle(status))
+        environment = get_service_environment(juju)
+        if condition(environment):
+            return environment
+        if time.monotonic() > deadline:
+            return environment  # The caller's assertions report what's wrong.
+        time.sleep(3)
 
 
 def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
@@ -95,9 +113,8 @@ def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
     )
     try:
         juju.config("boo", {"log-level": "debug"})
-        wait_for_settled(juju)
+        environment = wait_for_service_environment(juju, lambda env: "HTTP_PROXY" in env)
 
-        environment = get_service_environment(juju)
         assert environment["HTTP_PROXY"] == "http://squid.internal:3128"
         assert environment["http_proxy"] == "http://squid.internal:3128"
         assert environment["HTTPS_PROXY"] == "http://squid.internal:3129"
@@ -110,11 +127,10 @@ def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
         # Clean up: restore the defaults so that subsequent tests start clean.
         juju.model_config(reset=["juju-http-proxy", "juju-https-proxy", "juju-no-proxy"])
         juju.config("boo", reset=["log-level"])
-        wait_for_settled(juju)
 
     # Without the model's proxy settings, the charm must remove the variables that it set before.
-    # (The model's no-proxy setting has a default value, so NO_PROXY remains.)
-    environment = get_service_environment(juju)
+    # (The model's no-proxy setting has a default value, so NO_PROXY might remain.)
+    environment = wait_for_service_environment(juju, lambda env: "HTTP_PROXY" not in env)
     assert "HTTP_PROXY" not in environment
     assert "HTTPS_PROXY" not in environment
     assert "http_proxy" not in environment
