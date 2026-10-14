@@ -24,6 +24,7 @@ updates:
     open-pull-requests-limit: 100
     cooldown:
       default-days: 7
+      semver-major-days: 14
     groups:
       # Canonical's packages (we trust the release).
       canonical:
