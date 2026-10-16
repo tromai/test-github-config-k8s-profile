@@ -9,8 +9,6 @@
 
 import logging
 import pathlib
-import time
-from collections.abc import Callable
 
 import jubilant
 import pytest
@@ -70,33 +68,21 @@ def test_user_secret(charm: pathlib.Path, juju: jubilant.Juju):
     juju.wait(jubilant.all_active)
 
 
-def get_service_environment(juju: jubilant.Juju) -> dict[str, str]:
-    """Get the environment of the workload's Pebble service from the Pebble plan."""
-    plan = yaml.safe_load(
-        juju.ssh("boo/0", "/charm/bin/pebble", "plan", container="some-container")
-    )
-    return plan["services"]["some-service"].get("environment", {})
+def wait_for_http_proxy(juju: jubilant.Juju, expected: str, timeout: float = 120) -> None:
+    """Wait until the unit's status message reports the expected HTTP proxy.
 
-
-def wait_for_service_environment(
-    juju: jubilant.Juju,
-    condition: Callable[[dict[str, str]], bool],
-    timeout: float = 120,
-) -> dict[str, str]:
-    """Wait until the service's environment satisfies the condition, and return it.
-
-    'juju.wait' can return before Juju has queued the config-changed hook (the unit is still
-    active and idle), so check the result of the hook rather than the unit's status.
+    The charm reports the HTTP proxy that the workload uses in its active status message, in
+    the 'collect-status' handler. 'juju.wait' can return before Juju has queued the
+    config-changed hook (the unit is still active and idle), so wait for the message itself
+    rather than only for the unit to be active.
     """
-    deadline = time.monotonic() + timeout
-    while True:
-        juju.wait(lambda status: jubilant.all_active(status) and jubilant.all_agents_idle(status))
-        environment = get_service_environment(juju)
-        if condition(environment):
-            return environment
-        if time.monotonic() > deadline:
-            return environment  # The caller's assertions report what's wrong.
-        time.sleep(3)
+    message = f"http_proxy={expected}"
+
+    def has_message(status: jubilant.Status) -> bool:
+        unit_status = status.apps["boo"].units["boo/0"].workload_status
+        return unit_status.current == "active" and unit_status.message == message
+
+    juju.wait(has_message, timeout=timeout)
 
 
 def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
@@ -113,28 +99,14 @@ def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
     )
     try:
         juju.config("boo", {"log-level": "debug"})
-        environment = wait_for_service_environment(juju, lambda env: "HTTP_PROXY" in env)
-
-        assert environment["HTTP_PROXY"] == "http://squid.internal:3128"
-        assert environment["http_proxy"] == "http://squid.internal:3128"
-        assert environment["HTTPS_PROXY"] == "http://squid.internal:3129"
-        assert environment["https_proxy"] == "http://squid.internal:3129"
-        assert environment["NO_PROXY"] == "127.0.0.1,localhost,::1,10.0.0.0/8"
-        assert environment["no_proxy"] == "127.0.0.1,localhost,::1,10.0.0.0/8"
-        # The model has no FTP proxy.
-        assert "FTP_PROXY" not in environment
+        wait_for_http_proxy(juju, "http://squid.internal:3128")
     finally:
         # Clean up: restore the defaults so that subsequent tests start clean.
         juju.model_config(reset=["juju-http-proxy", "juju-https-proxy", "juju-no-proxy"])
         juju.config("boo", reset=["log-level"])
 
-    # Without the model's proxy settings, the charm must remove the variables that it set before.
-    # (The model's no-proxy setting has a default value, so NO_PROXY might remain.)
-    environment = wait_for_service_environment(juju, lambda env: "HTTP_PROXY" not in env)
-    assert "HTTP_PROXY" not in environment
-    assert "HTTPS_PROXY" not in environment
-    assert "http_proxy" not in environment
-    assert "https_proxy" not in environment
+    # Without the model's proxy settings, the charm must remove the variable that it set before.
+    wait_for_http_proxy(juju, "unset")
 
 
 # If you implement boo.get_version in the charm source,

@@ -47,6 +47,16 @@ def proxy_environment(proxy: ops.ProxyConfig) -> dict[str, str]:
     return environment
 
 
+def proxy_status_message(http_proxy: str | None) -> str:
+    """Format the HTTP proxy that the workload uses as a status message.
+
+    The integration tests read this message from the unit's status, which is more reliable than
+    searching the debug log. Proxy URLs can contain credentials, so don't use a real proxy URL
+    with credentials in a model that other people can read.
+    """
+    return f"http_proxy={http_proxy or 'unset'}"
+
+
 class BooCharm(ops.CharmBase):
     """Charm the application."""
 
@@ -54,6 +64,7 @@ class BooCharm(ops.CharmBase):
         super().__init__(framework)
         framework.observe(self.on["some_container"].pebble_ready, self._on_pebble_ready)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
+        framework.observe(self.on.collect_unit_status, self._on_collect_status)
         framework.observe(self.on["restart"].action, self._on_restart_action)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.secret_changed, self._on_secret_changed)
@@ -111,6 +122,21 @@ class BooCharm(ops.CharmBase):
         # 'get_content' to read the latest revision. This charm doesn't demonstrate that; see
         # https://canonical.com/juju/docs/ops/latest/howto/manage-secrets/
         self.unit.status = ops.ActiveStatus()
+
+    def _on_collect_status(self, event: ops.CollectStatusEvent):
+        """Report the HTTP proxy that the workload uses in the unit's active status message."""
+        # Leave any other status (blocked, maintenance, waiting) as the handlers set it.
+        if not isinstance(self.unit.status, ops.ActiveStatus):
+            return
+        if not self.container.can_connect():
+            return
+        try:
+            plan = self.container.get_plan()
+        except ops.pebble.ConnectionError:
+            return  # The container went away after the check.
+        service = plan.services.get(SERVICE_NAME)
+        environment = service.environment if service else {}
+        event.add_status(ops.ActiveStatus(proxy_status_message(environment.get("HTTP_PROXY"))))
 
     def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent):
         """Handle upgrade-charm event — the model's proxy settings might have changed."""

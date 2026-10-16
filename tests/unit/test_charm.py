@@ -74,7 +74,7 @@ def test_pebble_ready(monkeypatch: pytest.MonkeyPatch):
     container_out = state_out.get_container(container_in.name)
     assert container_out.service_statuses[SERVICE_NAME] == ops.pebble.ServiceStatus.ACTIVE
     assert state_out.workload_version is not None
-    assert state_out.unit_status == testing.ActiveStatus()
+    assert state_out.unit_status == testing.ActiveStatus("http_proxy=unset")
 
 
 def test_pebble_ready_service_not_ready():
@@ -113,7 +113,7 @@ def test_restart_action():
     # Assert:
     container_out = state_out.get_container(container_in.name)
     assert container_out.service_statuses[SERVICE_NAME] == ops.pebble.ServiceStatus.ACTIVE
-    assert state_out.unit_status == testing.ActiveStatus()
+    assert state_out.unit_status == testing.ActiveStatus("http_proxy=unset")
 
 
 def test_restart_action_service_not_ready():
@@ -320,7 +320,11 @@ def test_secret_changed_new_api_token_revision():
         label=API_TOKEN_LABEL,
         owner=None,  # user-owned secret (not app- or unit-owned)
     )
-    state_in = testing.State(secrets={secret}, config={"api-token": secret.id})
+    state_in = testing.State(
+        containers={testing.Container("some-container")},
+        secrets={secret},
+        config={"api-token": secret.id},
+    )
 
     # Act:
     state_out = ctx.run(ctx.on.secret_changed(secret), state_in)
@@ -423,7 +427,7 @@ def test_pebble_ready_passes_proxy_settings_to_workload(monkeypatch: pytest.Monk
 
     # Assert:
     assert get_service_environment(state_out) == EXPECTED_PROXY_ENVIRONMENT
-    assert state_out.unit_status == testing.ActiveStatus()
+    assert state_out.unit_status == testing.ActiveStatus("http_proxy=http://squid.internal:3128")
 
 
 def test_pebble_ready_without_proxy_settings(monkeypatch: pytest.MonkeyPatch):
@@ -492,6 +496,54 @@ def test_upgrade_charm_updates_proxy_settings():
 
     # Assert:
     assert get_service_environment(state_out) == EXPECTED_PROXY_ENVIRONMENT
+
+
+def test_collect_status_reports_workload_http_proxy():
+    """Test that the active status message shows the HTTP proxy that the workload uses."""
+    # Arrange — the workload's Pebble layer has an HTTP proxy that differs from the model's:
+    ctx = testing.Context(BooCharm)
+    layer = ops.pebble.Layer(MOCK_LAYER.to_dict())
+    layer.services[SERVICE_NAME].environment = {"HTTP_PROXY": "http://workload.internal:3128"}
+    container_in = testing.Container("some-container", can_connect=True, layers={"base": layer})
+    state_in = testing.State(containers={container_in}, unit_status=testing.ActiveStatus())
+
+    # Act:
+    state_out = ctx.run(ctx.on.update_status(), state_in)
+
+    # Assert:
+    assert state_out.unit_status == testing.ActiveStatus(
+        "http_proxy=http://workload.internal:3128"
+    )
+
+
+def test_collect_status_leaves_other_statuses_alone():
+    """Test that collect-status doesn't replace a status that isn't active."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container_in = make_container(ops.pebble.CheckStatus.UP)
+    state_in = testing.State(
+        containers={container_in}, unit_status=testing.BlockedStatus("something is wrong")
+    )
+
+    # Act:
+    state_out = ctx.run(ctx.on.update_status(), state_in)
+
+    # Assert:
+    assert state_out.unit_status == testing.BlockedStatus("something is wrong")
+
+
+def test_collect_status_container_not_ready():
+    """Test that collect-status doesn't fail if Pebble isn't ready."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container_in = testing.Container("some-container", can_connect=False)
+    state_in = testing.State(containers={container_in}, unit_status=testing.ActiveStatus())
+
+    # Act:
+    state_out = ctx.run(ctx.on.update_status(), state_in)
+
+    # Assert:
+    assert state_out.unit_status == testing.ActiveStatus()
 
 
 def test_config_changed_container_not_ready():
