@@ -68,6 +68,45 @@ def test_user_secret(charm: pathlib.Path, juju: jubilant.Juju):
     juju.wait(jubilant.all_active)
 
 
+def get_http_proxy_message(juju: jubilant.Juju) -> str:
+    """Wait for the unit to settle, then return its status message.
+
+    The charm reports the HTTP proxy that the workload uses in its active status message, in
+    the 'collect-status' handler. 'juju.wait' can return before Juju has queued the
+    config-changed hook (the unit is still active and idle), so require the unit to look active
+    and idle for several checks in a row, which gives the hook time to start and finish.
+    """
+    status = juju.wait(
+        lambda status: jubilant.all_active(status) and jubilant.all_agents_idle(status),
+        successes=10,
+    )
+    return status.apps["boo"].units["boo/0"].workload_status.message
+
+
+def test_model_proxy_settings(charm: pathlib.Path, juju: jubilant.Juju):
+    """Test that the charm gives the workload the model's proxy settings."""
+    # Juju emits no event when 'juju-*-proxy' model config changes. The charm picks up the new
+    # settings the next time that it handles an event, so trigger config-changed by changing a
+    # charm config option.
+    juju.model_config(
+        {
+            "juju-http-proxy": "http://squid.internal:3128",
+            "juju-https-proxy": "http://squid.internal:3129",
+            "juju-no-proxy": "127.0.0.1,localhost,::1,10.0.0.0/8",
+        }
+    )
+    try:
+        juju.config("boo", {"log-level": "debug"})
+        assert get_http_proxy_message(juju) == "http_proxy=http://squid.internal:3128"
+    finally:
+        # Clean up: restore the defaults so that subsequent tests start clean.
+        juju.model_config(reset=["juju-http-proxy", "juju-https-proxy", "juju-no-proxy"])
+        juju.config("boo", reset=["log-level"])
+
+    # Without the model's proxy settings, the charm must remove the variable that it set before.
+    assert get_http_proxy_message(juju) == "http_proxy=unset"
+
+
 # If you implement boo.get_version in the charm source,
 # remove the @pytest.mark.skip line to enable this test.
 # Alternatively, remove this test if you don't need it.
