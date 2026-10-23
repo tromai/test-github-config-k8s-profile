@@ -34,10 +34,9 @@ def proxy_environment(proxy: ops.ProxyConfig) -> dict[str, str]:
     model doesn't provide are left out.
     """
     settings = {
-        "HTTP_PROXY": proxy.http_proxy,
-        "HTTPS_PROXY": proxy.https_proxy,
-        "FTP_PROXY": proxy.ftp_proxy,
-        "NO_PROXY": proxy.no_proxy,
+        "HTTP_PROXY": proxy.http,
+        "HTTPS_PROXY": proxy.https,
+        "NO_PROXY": ",".join(proxy.no),
     }
     environment: dict[str, str] = {}
     for name, value in settings.items():

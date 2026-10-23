@@ -359,9 +359,9 @@ def test_secret_remove():
 def make_proxy_state(container: testing.Container) -> testing.State:
     """Build a state in which the model has proxy settings (like 'juju model-config')."""
     proxy_config = testing.ProxyConfig(
-        http_proxy="http://squid.internal:3128",
-        https_proxy="http://squid.internal:3129",
-        no_proxy="127.0.0.1,localhost,::1,10.0.0.0/8",
+        http="http://squid.internal:3128",
+        https="http://squid.internal:3129",
+        no=("127.0.0.1", "localhost", "::1", "10.0.0.0/8"),
     )
     return testing.State(
         containers={container},
@@ -389,18 +389,15 @@ def get_service_environment(state: testing.State) -> dict[str, str]:
 def test_proxy_environment():
     """Test that all of the model's proxy settings become upper- and lower-case variables."""
     proxy = ops.ProxyConfig(
-        http_proxy="http://a:1",
-        https_proxy="http://b:2",
-        ftp_proxy="http://c:3",
-        no_proxy="localhost",
+        http="http://a:1",
+        https="http://b:2",
+        no=("localhost",),
     )
     assert proxy_environment(proxy) == {
         "HTTP_PROXY": "http://a:1",
         "http_proxy": "http://a:1",
         "HTTPS_PROXY": "http://b:2",
         "https_proxy": "http://b:2",
-        "FTP_PROXY": "http://c:3",
-        "ftp_proxy": "http://c:3",
         "NO_PROXY": "localhost",
         "no_proxy": "localhost",
     }
@@ -409,7 +406,7 @@ def test_proxy_environment():
 def test_proxy_environment_omits_missing_settings():
     """Test that settings that the model doesn't provide are left out."""
     assert proxy_environment(ops.ProxyConfig()) == {}
-    assert proxy_environment(ops.ProxyConfig(https_proxy="http://b:2")) == {
+    assert proxy_environment(ops.ProxyConfig(https="http://b:2")) == {
         "HTTPS_PROXY": "http://b:2",
         "https_proxy": "http://b:2",
     }
@@ -568,6 +565,5 @@ def test_proxy_settings_are_visible_in_the_charm():
 
     # Act and assert:
     with ctx(ctx.on.config_changed(), make_proxy_state(container_in)) as manager:
-        assert manager.charm.model.proxy_config.https_proxy == "http://squid.internal:3129"
-        assert manager.charm.model.proxy_config.ftp_proxy is None
+        assert manager.charm.model.proxy_config.https == "http://squid.internal:3129"
         manager.run()
