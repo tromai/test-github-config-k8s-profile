@@ -78,14 +78,14 @@ actions:
 # https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/#containers
 containers:
   some-container:
-    resource: demo-server-image
+    resource: some-container-image
 
 # This field populates the Resources tab on Charmhub.
 # https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/#resources
 resources:
   # An OCI image resource for each container listed above.
   # You may remove this if your charm will run without a workload sidecar container.
-  demo-server-image:
+  some-container-image:
     type: oci-image
     description: OCI image for the 'some-container' container
     # The upstream-source field is ignored by Charmcraft and Juju, but it can be
