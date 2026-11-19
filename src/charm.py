@@ -107,11 +107,12 @@ class BooCharm(ops.CharmBase):
         if service is None:
             # The proxy layer can only merge into a service that's already defined.
             return
+        # Pebble restarts the service only if the plan changed, so the service doesn't restart
+        # when the proxy configs are the same. If the proxy configs were in a configuration file,
+        # the charm would need to compare the file and restart the service itself.
         proxy_env = self._get_proxy_environ()
-        changed = any(service.environment.get(name) != value for name, value in proxy_env.items())
-        if changed:
-            self.container.add_layer(PROXY_LAYER_LABEL, self._proxy_layer(proxy_env), combine=True)
-            self.container.replan()
+        self.container.add_layer(PROXY_LAYER_LABEL, self._proxy_layer(proxy_env), combine=True)
+        self.container.replan()
 
     def _on_restart_action(self, event: ops.ActionEvent):
         """Handle the restart action."""
