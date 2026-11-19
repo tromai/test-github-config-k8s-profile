@@ -81,7 +81,15 @@ def frequent_update_status(juju: jubilant.Juju):
 
 def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
     """Return the environment of the workload service in the Pebble plan."""
-    plan = juju.ssh("boo/0", "/charm/bin/pebble", "plan", container="some-container")
+    # Run Pebble in the charm container, because a rock doesn't have the shell that
+    # 'juju ssh --container' needs.
+    plan = juju.ssh(
+        "boo/0",
+        "env",
+        "PEBBLE_SOCKET=/charm/containers/some-container/pebble.socket",
+        "/charm/bin/pebble",
+        "plan",
+    )
     return yaml.safe_load(plan)["services"]["fastapi"].get("environment", {})
 
 

@@ -46,29 +46,14 @@ class BooCharm(ops.CharmBase):
     def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
         """Handle pebble-ready event."""
         self.unit.status = ops.MaintenanceStatus("starting workload")
-        # To start the workload, we'll add a Pebble layer to the workload container.
-        # The layer specifies which service to run.
-        # The charm expects the service to have a long-running command. Don't use a command that
-        # starts the workload as a daemon then exits, otherwise Pebble either reports the service
-        # as stopped (if the command exits quickly) or keeps restarting the service.
-        layer: ops.pebble.LayerDict = {
-            "services": {
-                SERVICE_NAME: {
-                    "override": "replace",
-                    "summary": "A service that runs in the workload container",
-                    "command": "uvicorn api_demo_server.app:app --host=0.0.0.0 --port=8000",
-                    "startup": "enabled",
-                }
-            }
-        }
-        self.container.add_layer("base", layer, combine=True)
-        # If the container image is a rock, the container already has a Pebble layer.
-        # In this case, you could remove 'add_layer' or use 'add_layer' to extend the rock's layer.
-        # To learn about rocks, see https://ubuntu.com/containers/rockcraft/docs/
+        # The api-demo-server rock already has a Pebble layer that defines the 'fastapi' service.
+        # If your container image doesn't define the service, use 'add_layer' to add a layer
+        # with the service before calling the reconciler, because the proxy layer can only
+        # merge into a service that's already defined.
+        # To learn about rocks, see https://documentation.ubuntu.com/rockcraft/stable/
         #
-        # The proxy configs can only be merged into a service that's already defined, so the
-        # reconciler must run after the base layer is added. It adds the proxy layer and starts
-        # the service, so that the service never runs without the proxy configs.
+        # The reconciler adds the proxy layer and starts the service, so that the service
+        # never runs without the proxy configs.
         self._reconcile(event)
         self.container.replan()  # Starts the service (because 'startup' is enabled in the layer).
         self.wait_for_ready()
