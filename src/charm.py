@@ -16,7 +16,8 @@ import boo
 
 logger = logging.getLogger(__name__)
 
-SERVICE_NAME = "some-service"  # Name of Pebble service that runs in the workload container.
+SERVICE_NAME = "fastapi"  # Name of Pebble service that runs in the workload container.
+PROXY_LAYER_LABEL = "proxy-workload"  # The Pebble layer that has the proxy configs.
 
 # This charm demonstrates the two independent roles a charm plays with Juju secrets.
 # The two secrets below are unrelated: one is observed, the other is owned.
@@ -33,6 +34,8 @@ class BooCharm(ops.CharmBase):
         super().__init__(framework)
         framework.observe(self.on["some_container"].pebble_ready, self._on_pebble_ready)
         framework.observe(self.on["restart"].action, self._on_restart_action)
+        framework.observe(self.on.config_changed, self._reconcile)
+        framework.observe(self.on.update_status, self._reconcile)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.secret_changed, self._on_secret_changed)
         framework.observe(self.on.secret_rotate, self._on_secret_rotate)
@@ -53,7 +56,7 @@ class BooCharm(ops.CharmBase):
                 SERVICE_NAME: {
                     "override": "replace",
                     "summary": "A service that runs in the workload container",
-                    "command": "sleep infinity",  # Change this!
+                    "command": "uvicorn api_demo_server.app:app --host=0.0.0.0 --port=8000",
                     "startup": "enabled",
                 }
             }
@@ -62,6 +65,11 @@ class BooCharm(ops.CharmBase):
         # If the container image is a rock, the container already has a Pebble layer.
         # In this case, you could remove 'add_layer' or use 'add_layer' to extend the rock's layer.
         # To learn about rocks, see https://ubuntu.com/containers/rockcraft/docs/
+        #
+        # The proxy configs can only be merged into a service that's already defined, so the
+        # reconciler must run after the base layer is added. It adds the proxy layer and starts
+        # the service, so that the service never runs without the proxy configs.
+        self._reconcile(event)
         self.container.replan()  # Starts the service (because 'startup' is enabled in the layer).
         self.wait_for_ready()
         version = boo.get_version()
@@ -77,6 +85,48 @@ class BooCharm(ops.CharmBase):
         # 'get_content' to read the latest revision. This charm doesn't demonstrate that; see
         # https://canonical.com/juju/docs/ops/latest/howto/manage-secrets/
         self.unit.status = ops.ActiveStatus()
+
+    def _get_proxy_environ(self) -> dict[str, str]:
+        """Convert the proxy configs of the model into environment variables."""
+        proxy = self.model.proxy_config
+        no_proxy = ",".join(sorted(proxy.no))
+        return {
+            "HTTP_PROXY": proxy.http or "",
+            "HTTPS_PROXY": proxy.https or "",
+            "NO_PROXY": no_proxy,
+            "http_proxy": proxy.http or "",
+            "https_proxy": proxy.https or "",
+            "no_proxy": no_proxy,
+        }
+
+    def _proxy_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
+        """Build a Pebble layer that adds the proxy configs to the workload service."""
+        return ops.pebble.Layer(
+            {
+                "services": {
+                    SERVICE_NAME: {
+                        "override": "merge",
+                        "environment": proxy_env,
+                    },
+                },
+            }
+        )
+
+    def _reconcile(self, event: ops.EventBase) -> None:
+        """Make the workload use the current proxy configs of the model."""
+        # Juju doesn't emit an event when the proxy configs change, so the charm can only
+        # notice a change when it handles the next event, such as update-status.
+        if not self.container.can_connect():
+            return
+        service = self.container.get_plan().services.get(SERVICE_NAME)
+        if service is None:
+            # The proxy layer can only merge into a service that's already defined.
+            return
+        proxy_env = self._get_proxy_environ()
+        changed = any(service.environment.get(name) != value for name, value in proxy_env.items())
+        if changed:
+            self.container.add_layer(PROXY_LAYER_LABEL, self._proxy_layer(proxy_env), combine=True)
+            self.container.replan()
 
     def _on_restart_action(self, event: ops.ActionEvent):
         """Handle the restart action."""
