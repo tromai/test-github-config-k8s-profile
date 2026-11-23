@@ -68,6 +68,9 @@ def test_user_secret(charm: pathlib.Path, juju: jubilant.Juju):
     juju.wait(jubilant.all_active)
 
 
+CONTAINER = "some-container"
+UNIT = "boo/0"
+SERVICE = "fastapi"
 PROXY_URL = "http://proxy.example.com:3128"
 
 
@@ -84,30 +87,44 @@ def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
     # Run Pebble in the charm container, because a rock doesn't have the shell that
     # 'juju ssh --container' needs.
     plan = juju.ssh(
-        "boo/0",
+        UNIT,
         "env",
-        "PEBBLE_SOCKET=/charm/containers/some-container/pebble.socket",
+        f"PEBBLE_SOCKET=/charm/containers/{CONTAINER}/pebble.socket",
         "/charm/bin/pebble",
         "plan",
     )
-    return yaml.safe_load(plan)["services"]["fastapi"].get("environment", {})
+    return yaml.safe_load(plan)["services"][SERVICE].get("environment", {})
 
 
-def test_proxy_configs_reach_the_workload(juju: jubilant.Juju):
-    """Test that the workload gets the proxy configs of the model."""
-    juju.model_config({"juju-https-proxy": PROXY_URL})
+def test_proxy_configs(juju: jubilant.Juju):
+    """Test that the workload gets and clears the proxy configs of the model."""
+    juju.model_config({"juju-https-proxy": PROXY_URL, "juju-no-proxy": "localhost,10.0.0.0/8"})
+    expected = {
+        "HTTP_PROXY": "",
+        "HTTPS_PROXY": PROXY_URL,
+        "NO_PROXY": "10.0.0.0/8,localhost",
+        "http_proxy": "",
+        "https_proxy": PROXY_URL,
+        "no_proxy": "10.0.0.0/8,localhost",
+    }
     juju.wait(
-        lambda _: workload_environment(juju).get("HTTPS_PROXY") == PROXY_URL,
+        lambda _: workload_environment(juju).items() >= expected.items(),
         delay=5,
         timeout=120,
     )
 
-
-def test_removed_proxy_configs_are_cleared(juju: jubilant.Juju):
-    """Test that the workload loses the proxy configs that the user removed from the model."""
-    juju.model_config(reset="juju-https-proxy")
+    # Removed proxy configs are cleared, and juju-no-proxy returns to the Juju default.
+    juju.model_config(reset=["juju-https-proxy", "juju-no-proxy"])
+    expected = {
+        "HTTP_PROXY": "",
+        "HTTPS_PROXY": "",
+        "NO_PROXY": "127.0.0.1,::1,localhost",
+        "http_proxy": "",
+        "https_proxy": "",
+        "no_proxy": "127.0.0.1,::1,localhost",
+    }
     juju.wait(
-        lambda _: workload_environment(juju).get("HTTPS_PROXY") == "",
+        lambda _: workload_environment(juju).items() >= expected.items(),
         delay=5,
         timeout=120,
     )

@@ -17,7 +17,10 @@ import boo
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "fastapi"  # Name of Pebble service that runs in the workload container.
-PROXY_LAYER_LABEL = "proxy-workload"  # The Pebble layer that has the proxy configs.
+BASE_LAYER_LABEL = "base"  # The Pebble layer that defines the workload service.
+PROXY_LAYER_LABEL = "proxy"  # The Pebble layer that has the proxy configs.
+# Other pods must be able to reach the workload through its Service.
+WORKLOAD_COMMAND = "/bin/uvicorn api_demo_server.app:app --host 0.0.0.0 --port 8000"
 
 # This charm demonstrates the two independent roles a charm plays with Juju secrets.
 # The two secrets below are unrelated: one is observed, the other is owned.
@@ -32,6 +35,8 @@ class BooCharm(ops.CharmBase):
 
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
+        self.container = self.unit.get_container("some-container")
+        framework.observe(self.on["some_container"].pebble_ready, self._reconcile)
         framework.observe(self.on["some_container"].pebble_ready, self._on_pebble_ready)
         framework.observe(self.on["restart"].action, self._on_restart_action)
         framework.observe(self.on.config_changed, self._reconcile)
@@ -41,21 +46,10 @@ class BooCharm(ops.CharmBase):
         framework.observe(self.on.secret_rotate, self._on_secret_rotate)
         framework.observe(self.on.secret_expired, self._on_secret_expired)
         framework.observe(self.on.secret_remove, self._on_secret_remove)
-        self.container = self.unit.get_container("some-container")
 
     def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
         """Handle pebble-ready event."""
         self.unit.status = ops.MaintenanceStatus("starting workload")
-        # The api-demo-server rock already has a Pebble layer that defines the 'fastapi' service.
-        # If your container image doesn't define the service, use 'add_layer' to add a layer
-        # with the service before calling the reconciler, because the proxy layer can only
-        # merge into a service that's already defined.
-        # To learn about rocks, see https://documentation.ubuntu.com/rockcraft/stable/
-        #
-        # The reconciler adds the proxy layer and starts the service, so that the service
-        # never runs without the proxy configs.
-        self._reconcile(event)
-        self.container.replan()  # Starts the service (because 'startup' is enabled in the layer).
         self.wait_for_ready()
         version = boo.get_version()
         if version is not None:
@@ -84,6 +78,21 @@ class BooCharm(ops.CharmBase):
             "no_proxy": no_proxy,
         }
 
+    def _base_layer(self) -> ops.pebble.Layer:
+        """Build the Pebble layer that defines the workload service."""
+        return ops.pebble.Layer(
+            {
+                "services": {
+                    SERVICE_NAME: {
+                        "override": "replace",
+                        "command": WORKLOAD_COMMAND,
+                        "startup": "enabled",
+                        "environment": {"DEMO_SERVER_LOGFILE": "/tmp/demo_server.log"},
+                    },
+                },
+            }
+        )
+
     def _proxy_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
         """Build a Pebble layer that adds the proxy configs to the workload service."""
         return ops.pebble.Layer(
@@ -103,14 +112,8 @@ class BooCharm(ops.CharmBase):
         # notice a change when it handles the next event, such as update-status.
         if not self.container.can_connect():
             return
-        service = self.container.get_plan().services.get(SERVICE_NAME)
-        if service is None:
-            # The proxy layer can only merge into a service that's already defined.
-            return
-        # Pebble restarts the service only if the plan changed, so the service doesn't restart
-        # when the proxy configs are the same. If the proxy configs were in a configuration file,
-        # the charm would need to compare the file and restart the service itself.
         proxy_env = self._get_proxy_environ()
+        self.container.add_layer(BASE_LAYER_LABEL, self._base_layer(), combine=True)
         self.container.add_layer(PROXY_LAYER_LABEL, self._proxy_layer(proxy_env), combine=True)
         self.container.replan()
 
