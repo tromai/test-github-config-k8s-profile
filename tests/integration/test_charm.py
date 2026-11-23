@@ -9,6 +9,7 @@
 
 import logging
 import pathlib
+from typing import Any
 
 import jubilant
 import pytest
@@ -82,7 +83,7 @@ def frequent_update_status(juju: jubilant.Juju):
     juju.model_config(reset="update-status-hook-interval")
 
 
-def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
+def workload_environment(juju: jubilant.Juju, ssh_access: dict[str, Any]) -> dict[str, str]:
     """Return the environment of the workload service in the Pebble plan."""
     # Run Pebble in the charm container, because a rock doesn't have the shell that
     # 'juju ssh --container' needs.
@@ -92,11 +93,12 @@ def workload_environment(juju: jubilant.Juju) -> dict[str, str]:
         f"PEBBLE_SOCKET=/charm/containers/{CONTAINER}/pebble.socket",
         "/charm/bin/pebble",
         "plan",
+        **ssh_access,
     )
     return yaml.safe_load(plan)["services"][SERVICE].get("environment", {})
 
 
-def test_proxy_configs(juju: jubilant.Juju):
+def test_proxy_configs(juju: jubilant.Juju, ssh_access: dict[str, Any]):
     """Test that the workload gets and clears the proxy configs of the model."""
     juju.model_config({"juju-https-proxy": PROXY_URL, "juju-no-proxy": "localhost,10.0.0.0/8"})
     expected = {
@@ -108,7 +110,7 @@ def test_proxy_configs(juju: jubilant.Juju):
         "no_proxy": "10.0.0.0/8,localhost",
     }
     juju.wait(
-        lambda _: workload_environment(juju).items() >= expected.items(),
+        lambda _: workload_environment(juju, ssh_access).items() >= expected.items(),
         delay=5,
         timeout=120,
     )
@@ -124,7 +126,7 @@ def test_proxy_configs(juju: jubilant.Juju):
         "no_proxy": "127.0.0.1,::1,localhost",
     }
     juju.wait(
-        lambda _: workload_environment(juju).items() >= expected.items(),
+        lambda _: workload_environment(juju, ssh_access).items() >= expected.items(),
         delay=5,
         timeout=120,
     )
