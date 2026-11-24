@@ -77,10 +77,17 @@ PROXY_URL = "http://proxy.example.com:3128"
 
 @pytest.fixture(scope="module", autouse=True)
 def frequent_update_status(juju: jubilant.Juju):
-    """Run update-status every 10 seconds, so the charm reads the new proxy configs sooner."""
-    juju.model_config({"update-status-hook-interval": "10s"})
+    """Run update-status every minute, so the charm reads the new proxy configs sooner."""
+    juju.model_config({"update-status-hook-interval": "1m"})
     yield
     juju.model_config(reset="update-status-hook-interval")
+
+
+@pytest.fixture
+def reset_proxy_configs(juju: jubilant.Juju):
+    """Reset the proxy configs after the test, even if the test fails."""
+    yield
+    juju.model_config(reset=["juju-https-proxy", "juju-no-proxy"])
 
 
 def workload_environment(juju: jubilant.Juju, ssh_access: dict[str, Any]) -> dict[str, str]:
@@ -98,6 +105,7 @@ def workload_environment(juju: jubilant.Juju, ssh_access: dict[str, Any]) -> dic
     return yaml.safe_load(plan)["services"][SERVICE].get("environment", {})
 
 
+@pytest.mark.usefixtures("reset_proxy_configs")
 def test_proxy_configs(juju: jubilant.Juju, ssh_access: dict[str, Any]):
     """Test that the workload gets and clears the proxy configs of the model."""
     juju.model_config({"juju-https-proxy": PROXY_URL, "juju-no-proxy": "localhost,10.0.0.0/8"})
@@ -112,7 +120,7 @@ def test_proxy_configs(juju: jubilant.Juju, ssh_access: dict[str, Any]):
     juju.wait(
         lambda _: workload_environment(juju, ssh_access).items() >= expected.items(),
         delay=5,
-        timeout=120,
+        timeout=300,
     )
 
     # Removed proxy configs are cleared, and juju-no-proxy returns to the Juju default.
@@ -128,7 +136,7 @@ def test_proxy_configs(juju: jubilant.Juju, ssh_access: dict[str, Any]):
     juju.wait(
         lambda _: workload_environment(juju, ssh_access).items() >= expected.items(),
         delay=5,
-        timeout=120,
+        timeout=300,
     )
 
 
