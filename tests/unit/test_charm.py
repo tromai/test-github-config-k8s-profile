@@ -3,6 +3,8 @@
 #
 # To learn more about testing, see https://canonical.com/juju/docs/ops/latest/explanation/testing/
 
+import dataclasses
+
 import ops
 import pytest
 from ops import testing
@@ -36,6 +38,11 @@ MOCK_LAYER = ops.pebble.Layer(
         },
     }
 )
+
+
+# The charm reconciles the proxy configs of the model when it handles config-changed and
+# update-status, so every state needs the workload container (which can't connect to Pebble).
+CONTAINER = testing.Container("some-container")
 
 
 def mock_get_version():
@@ -206,6 +213,7 @@ def test_config_changed_with_api_token():
         owner=None,  # user-owned secret (not app- or unit-owned)
     )
     state_in = testing.State(
+        containers={CONTAINER},
         secrets={secret},
         config={"api-token": secret.id},
     )
@@ -222,6 +230,7 @@ def test_config_changed_api_token_not_found():
     # Arrange:
     ctx = testing.Context(BooCharm)
     state_in = testing.State(
+        containers={CONTAINER},
         config={"api-token": "secret:doesnotexist00000000"},
         # No matching secret in state — simulates the secret not being granted.
     )
@@ -242,6 +251,7 @@ def test_config_changed_api_token_missing_key():
         owner=None,  # user-owned secret (not app- or unit-owned)
     )
     state_in = testing.State(
+        containers={CONTAINER},
         secrets={secret},
         config={"api-token": secret.id},
     )
@@ -257,7 +267,7 @@ def test_config_changed_no_token():
     """Test that config-changed without api-token set does nothing."""
     # Arrange:
     ctx = testing.Context(BooCharm)
-    state_in = testing.State()
+    state_in = testing.State(containers={CONTAINER})
 
     # Act:
     state_out = ctx.run(ctx.on.config_changed(), state_in)
@@ -347,3 +357,73 @@ def test_secret_remove():
 
     # Assert — the charm asked Juju to remove that revision:
     assert ctx.removed_secret_revisions == [2]
+
+
+PROXY_URL = "http://proxy.example.com:3128"
+
+
+def test_proxy_configs_reach_the_workload():
+    """Test that the proxy configs of the model are in the environment of the service."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container = testing.Container("some-container", can_connect=True)
+    proxy_config = testing.ProxyConfig(
+        https=PROXY_URL,
+        no=("localhost", "10.0.0.0/8"),
+    )
+    state_in = testing.State(
+        containers={container},
+        model=testing.Model(proxy_config=proxy_config),
+    )
+
+    # Act:
+    state_out = ctx.run(ctx.on.pebble_ready(container), state_in)
+
+    # Assert:
+    plan = state_out.get_container("some-container").plan
+    environment = plan.services[SERVICE_NAME].environment
+    assert environment["HTTPS_PROXY"] == PROXY_URL
+    assert environment["https_proxy"] == PROXY_URL
+    assert environment["HTTP_PROXY"] == ""
+    assert environment["NO_PROXY"] == "10.0.0.0/8,localhost"
+
+
+def test_removed_proxy_configs_are_cleared():
+    """Test that the service loses proxy configs that the user removed from the model."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container = testing.Container("some-container", can_connect=True)
+    state_in = testing.State(
+        containers={container},
+        model=testing.Model(proxy_config=testing.ProxyConfig(https=PROXY_URL)),
+    )
+    # The workload has proxy configs from an earlier event.
+    state_with_proxy = ctx.run(ctx.on.pebble_ready(container), state_in)
+    # `State` is immutable, so create a copy without the proxy configs.
+    state_without_proxy = dataclasses.replace(
+        state_with_proxy,
+        model=testing.Model(proxy_config=testing.ProxyConfig()),
+    )
+
+    # Act:
+    state_out = ctx.run(ctx.on.update_status(), state_without_proxy)
+
+    # Assert:
+    plan = state_out.get_container("some-container").plan
+    environment = plan.services[SERVICE_NAME].environment
+    assert environment["HTTPS_PROXY"] == ""
+    assert environment["https_proxy"] == ""
+
+
+def test_proxy_configs_are_skipped_if_the_container_is_not_ready():
+    """Test that the charm waits for Pebble instead of failing when it handles update-status."""
+    # Arrange:
+    ctx = testing.Context(BooCharm)
+    container = testing.Container("some-container", can_connect=False)
+    state_in = testing.State(containers={container})
+
+    # Act:
+    state_out = ctx.run(ctx.on.update_status(), state_in)
+
+    # Assert:
+    assert not state_out.get_container("some-container").plan.services

@@ -68,6 +68,37 @@ def test_user_secret(charm: pathlib.Path, juju: jubilant.Juju):
     juju.wait(jubilant.all_active)
 
 
+CONTAINER = "some-container"
+UNIT = "boo/0"
+SERVICE = "fastapi"
+PROXY_URL = "http://proxy.example.com:3128"
+
+
+def test_proxy_configuration(juju: jubilant.Juju):
+    proxy_url = "http://proxy.example.com:3128"
+    juju.model_config({"juju-https-proxy": proxy_url})
+    juju.config("boo", {"log-level": "debug"})
+    juju.wait(
+        lambda _: (
+            juju.run("boo/0", "show-proxy").results["https-proxy"]
+            == "http://proxy.example.com:3128"
+        ),
+        delay=2,
+        timeout=120,
+        successes=1,
+    )
+
+    juju.model_config(reset="juju-https-proxy")
+    juju.config("boo", {"log-level": "info"})
+    juju.wait(
+        lambda _: juju.run("boo/0", "show-proxy").results["https-proxy"] == "",
+        delay=2,
+        timeout=120,
+        successes=1,
+    )
+    # Use juju.model_config to restore model config if necessary.
+
+
 # If you implement boo.get_version in the charm source,
 # remove the @pytest.mark.skip line to enable this test.
 # Alternatively, remove this test if you don't need it.

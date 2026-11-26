@@ -8,6 +8,7 @@ import datetime
 import logging
 import secrets
 import time
+import urllib.error
 
 import ops
 
@@ -16,7 +17,9 @@ import boo
 
 logger = logging.getLogger(__name__)
 
-SERVICE_NAME = "some-service"  # Name of Pebble service that runs in the workload container.
+SERVICE_NAME = "fastapi"  # Name of Pebble service that runs in the workload container.
+# Other pods must be able to reach the workload through its Service.
+WORKLOAD_COMMAND = "/bin/uvicorn api_demo_server.app:app --host 0.0.0.0 --port 8000"
 
 # This charm demonstrates the two independent roles a charm plays with Juju secrets.
 # The two secrets below are unrelated: one is observed, the other is owned.
@@ -31,38 +34,39 @@ class BooCharm(ops.CharmBase):
 
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
+        self.container = self.unit.get_container("some-container")
+        framework.observe(self.on["some_container"].pebble_ready, self._reconcile)
         framework.observe(self.on["some_container"].pebble_ready, self._on_pebble_ready)
         framework.observe(self.on["restart"].action, self._on_restart_action)
+        framework.observe(self.on.config_changed, self._reconcile)
+        framework.observe(self.on.update_status, self._reconcile)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.secret_changed, self._on_secret_changed)
         framework.observe(self.on.secret_rotate, self._on_secret_rotate)
         framework.observe(self.on.secret_expired, self._on_secret_expired)
         framework.observe(self.on.secret_remove, self._on_secret_remove)
-        self.container = self.unit.get_container("some-container")
+        framework.observe(self.on["show-proxy"].action, self._on_show_proxy)
+
+    def _on_show_proxy(self, event: ops.ActionEvent) -> None:
+        for attempt in range(3):  # In general, allow more attempts for a complex workload.
+            if attempt:
+                time.sleep(2**attempt)  # If not first attempt, retry with exponential back-off.
+            try:
+                proxy = boo.get_proxy(8080)
+                break
+            except urllib.error.HTTPError as error:
+                error.close()  # Prevent a file handle leak.
+                continue
+            except urllib.error.URLError:
+                continue
+        else:
+            logger.error("The workload was not available within the expected time")
+            raise RuntimeError("workload is not available")
+        event.set_results({"https-proxy": proxy})
 
     def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
         """Handle pebble-ready event."""
         self.unit.status = ops.MaintenanceStatus("starting workload")
-        # To start the workload, we'll add a Pebble layer to the workload container.
-        # The layer specifies which service to run.
-        # The charm expects the service to have a long-running command. Don't use a command that
-        # starts the workload as a daemon then exits, otherwise Pebble either reports the service
-        # as stopped (if the command exits quickly) or keeps restarting the service.
-        layer: ops.pebble.LayerDict = {
-            "services": {
-                SERVICE_NAME: {
-                    "override": "replace",
-                    "summary": "A service that runs in the workload container",
-                    "command": "sleep infinity",  # Change this!
-                    "startup": "enabled",
-                }
-            }
-        }
-        self.container.add_layer("base", layer, combine=True)
-        # If the container image is a rock, the container already has a Pebble layer.
-        # In this case, you could remove 'add_layer' or use 'add_layer' to extend the rock's layer.
-        # To learn about rocks, see https://ubuntu.com/containers/rockcraft/docs/
-        self.container.replan()  # Starts the service (because 'startup' is enabled in the layer).
         self.wait_for_ready()
         version = boo.get_version()
         if version is not None:
@@ -77,6 +81,67 @@ class BooCharm(ops.CharmBase):
         # 'get_content' to read the latest revision. This charm doesn't demonstrate that; see
         # https://canonical.com/juju/docs/ops/latest/howto/manage-secrets/
         self.unit.status = ops.ActiveStatus()
+
+    def _get_proxy_environ(self) -> dict[str, str]:
+        """Convert the proxy configs of the model into environment variables."""
+        proxy = self.model.proxy_config
+        no_proxy = ",".join(sorted(proxy.no))
+        return {
+            "HTTP_PROXY": proxy.http or "",
+            "HTTPS_PROXY": proxy.https or "",
+            "NO_PROXY": no_proxy,
+            "http_proxy": proxy.http or "",
+            "https_proxy": proxy.https or "",
+            "no_proxy": no_proxy,
+        }
+
+    def _get_pebble_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
+        """Build the Pebble layer with the workload and proxy-display services.
+
+        Both services get the proxy configs of the model as environment variables.
+        """
+        proxy_server_command = (
+            "python3 -c 'import os; "
+            "from http.server import BaseHTTPRequestHandler, HTTPServer; "
+            'body = os.environ.get("HTTPS_PROXY", "").encode(); '
+            'Handler = type("Handler", (BaseHTTPRequestHandler,), '
+            '{"do_GET": lambda self: ('
+            "self.send_response(200), "
+            'self.send_header("Content-Type", "text/plain; charset=utf-8"), '
+            'self.send_header("Content-Length", str(len(body))), '
+            "self.end_headers(), "
+            "self.wfile.write(body)"
+            ")}); "
+            'HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()\''
+        )
+        return ops.pebble.Layer(
+            {
+                "services": {
+                    SERVICE_NAME: {
+                        "override": "replace",
+                        "command": WORKLOAD_COMMAND,
+                        "startup": "enabled",
+                        "environment": proxy_env,
+                    },
+                    "proxy-display": {
+                        "override": "replace",
+                        "command": proxy_server_command,
+                        "startup": "enabled",
+                        "environment": proxy_env,
+                    },
+                },
+            }
+        )
+
+    def _reconcile(self, event: ops.EventBase) -> None:
+        """Make the workload use the current proxy configs of the model."""
+        # Juju doesn't emit an event when the proxy configs change, so the charm can only
+        # notice a change when it handles the next event, such as update-status.
+        if not self.container.can_connect():
+            return
+        proxy_env = self._get_proxy_environ()
+        self.container.add_layer("fastapi", self._get_pebble_layer(proxy_env), combine=True)
+        self.container.replan()
 
     def _on_restart_action(self, event: ops.ActionEvent):
         """Handle the restart action."""

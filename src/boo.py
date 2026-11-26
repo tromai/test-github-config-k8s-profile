@@ -7,6 +7,7 @@ The intention is that this module could be used outside the context of a charm.
 """
 
 import logging
+import urllib.request
 
 logger = logging.getLogger(__name__)
 
@@ -18,3 +19,9 @@ def get_version() -> str | None:
     """Get the running version of the workload."""
     # You'll need to implement this function (or remove it if not needed).
     return None
+
+
+def get_proxy(port: int) -> str:
+    """Get the proxy configs that the proxy-display service reports."""
+    response = urllib.request.urlopen(f"http://localhost:{port}")
+    return response.read().decode()
