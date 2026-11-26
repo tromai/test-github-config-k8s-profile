@@ -8,6 +8,7 @@ import datetime
 import logging
 import secrets
 import time
+import urllib.error
 
 import ops
 
@@ -17,8 +18,6 @@ import boo
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "fastapi"  # Name of Pebble service that runs in the workload container.
-BASE_LAYER_LABEL = "base"  # The Pebble layer that defines the workload service.
-PROXY_LAYER_LABEL = "proxy"  # The Pebble layer that has the proxy configs.
 # Other pods must be able to reach the workload through its Service.
 WORKLOAD_COMMAND = "/bin/uvicorn api_demo_server.app:app --host 0.0.0.0 --port 8000"
 
@@ -46,6 +45,24 @@ class BooCharm(ops.CharmBase):
         framework.observe(self.on.secret_rotate, self._on_secret_rotate)
         framework.observe(self.on.secret_expired, self._on_secret_expired)
         framework.observe(self.on.secret_remove, self._on_secret_remove)
+        framework.observe(self.on["show-proxy"].action, self._on_show_proxy)
+
+    def _on_show_proxy(self, event: ops.ActionEvent) -> None:
+        for attempt in range(3):  # In general, allow more attempts for a complex workload.
+            if attempt:
+                time.sleep(2**attempt)  # If not first attempt, retry with exponential back-off.
+            try:
+                proxy = boo.get_proxy(8080)
+                break
+            except urllib.error.HTTPError as error:
+                error.close()  # Prevent a file handle leak.
+                continue
+            except urllib.error.URLError:
+                continue
+        else:
+            logger.error("The workload was not available within the expected time")
+            raise RuntimeError("workload is not available")
+        event.set_results({"https-proxy": proxy})
 
     def _on_pebble_ready(self, event: ops.PebbleReadyEvent):
         """Handle pebble-ready event."""
@@ -78,8 +95,25 @@ class BooCharm(ops.CharmBase):
             "no_proxy": no_proxy,
         }
 
-    def _base_layer(self) -> ops.pebble.Layer:
-        """Build the Pebble layer that defines the workload service."""
+    def _get_pebble_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
+        """Build the Pebble layer with the workload and proxy-display services.
+
+        Both services get the proxy configs of the model as environment variables.
+        """
+        proxy_server_command = (
+            "python3 -c 'import os; "
+            "from http.server import BaseHTTPRequestHandler, HTTPServer; "
+            'body = os.environ.get("HTTPS_PROXY", "").encode(); '
+            'Handler = type("Handler", (BaseHTTPRequestHandler,), '
+            '{"do_GET": lambda self: ('
+            "self.send_response(200), "
+            'self.send_header("Content-Type", "text/plain; charset=utf-8"), '
+            'self.send_header("Content-Length", str(len(body))), '
+            "self.end_headers(), "
+            "self.wfile.write(body)"
+            ")}); "
+            'HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()\''
+        )
         return ops.pebble.Layer(
             {
                 "services": {
@@ -87,19 +121,12 @@ class BooCharm(ops.CharmBase):
                         "override": "replace",
                         "command": WORKLOAD_COMMAND,
                         "startup": "enabled",
-                        "environment": {"DEMO_SERVER_LOGFILE": "/tmp/demo_server.log"},
+                        "environment": proxy_env,
                     },
-                },
-            }
-        )
-
-    def _proxy_layer(self, proxy_env: dict[str, str]) -> ops.pebble.Layer:
-        """Build a Pebble layer that adds the proxy configs to the workload service."""
-        return ops.pebble.Layer(
-            {
-                "services": {
-                    SERVICE_NAME: {
-                        "override": "merge",
+                    "proxy-display": {
+                        "override": "replace",
+                        "command": proxy_server_command,
+                        "startup": "enabled",
                         "environment": proxy_env,
                     },
                 },
@@ -113,8 +140,7 @@ class BooCharm(ops.CharmBase):
         if not self.container.can_connect():
             return
         proxy_env = self._get_proxy_environ()
-        self.container.add_layer(BASE_LAYER_LABEL, self._base_layer(), combine=True)
-        self.container.add_layer(PROXY_LAYER_LABEL, self._proxy_layer(proxy_env), combine=True)
+        self.container.add_layer("fastapi", self._get_pebble_layer(proxy_env), combine=True)
         self.container.replan()
 
     def _on_restart_action(self, event: ops.ActionEvent):

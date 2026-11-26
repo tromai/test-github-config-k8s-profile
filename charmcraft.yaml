@@ -77,6 +77,8 @@ actions:
 
       Use this to apply a change that the workload only picks up on startup,
       or to recover a workload that has stopped responding.
+  show-proxy:
+    description: asdfasdf
 
 # Your workload's containers.
 # https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/#containers

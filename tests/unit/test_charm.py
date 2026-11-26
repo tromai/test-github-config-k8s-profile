@@ -398,14 +398,15 @@ def test_removed_proxy_configs_are_cleared():
         model=testing.Model(proxy_config=testing.ProxyConfig(https=PROXY_URL)),
     )
     # The workload has proxy configs from an earlier event.
-    state_mid = ctx.run(ctx.on.pebble_ready(container), state_in)
-    state_mid = dataclasses.replace(
-        state_mid,
+    state_with_proxy = ctx.run(ctx.on.pebble_ready(container), state_in)
+    # `State` is immutable, so create a copy without the proxy configs.
+    state_without_proxy = dataclasses.replace(
+        state_with_proxy,
         model=testing.Model(proxy_config=testing.ProxyConfig()),
     )
 
     # Act:
-    state_out = ctx.run(ctx.on.update_status(), state_mid)
+    state_out = ctx.run(ctx.on.update_status(), state_without_proxy)
 
     # Assert:
     plan = state_out.get_container("some-container").plan

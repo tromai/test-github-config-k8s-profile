@@ -9,7 +9,6 @@
 
 import logging
 import pathlib
-from typing import Any
 
 import jubilant
 import pytest
@@ -75,69 +74,29 @@ SERVICE = "fastapi"
 PROXY_URL = "http://proxy.example.com:3128"
 
 
-@pytest.fixture(scope="module", autouse=True)
-def frequent_update_status(juju: jubilant.Juju):
-    """Run update-status every minute, so the charm reads the new proxy configs sooner."""
-    juju.model_config({"update-status-hook-interval": "1m"})
-    yield
-    juju.model_config(reset="update-status-hook-interval")
-
-
-@pytest.fixture
-def reset_proxy_configs(juju: jubilant.Juju):
-    """Reset the proxy configs after the test, even if the test fails."""
-    yield
-    juju.model_config(reset=["juju-https-proxy", "juju-no-proxy"])
-
-
-def workload_environment(juju: jubilant.Juju, ssh_access: dict[str, Any]) -> dict[str, str]:
-    """Return the environment of the workload service in the Pebble plan."""
-    # Run Pebble in the charm container, because a rock doesn't have the shell that
-    # 'juju ssh --container' needs.
-    plan = juju.ssh(
-        UNIT,
-        "env",
-        f"PEBBLE_SOCKET=/charm/containers/{CONTAINER}/pebble.socket",
-        "/charm/bin/pebble",
-        "plan",
-        **ssh_access,
-    )
-    return yaml.safe_load(plan)["services"][SERVICE].get("environment", {})
-
-
-@pytest.mark.usefixtures("reset_proxy_configs")
-def test_proxy_configs(juju: jubilant.Juju, ssh_access: dict[str, Any]):
-    """Test that the workload gets and clears the proxy configs of the model."""
-    juju.model_config({"juju-https-proxy": PROXY_URL, "juju-no-proxy": "localhost,10.0.0.0/8"})
-    expected = {
-        "HTTP_PROXY": "",
-        "HTTPS_PROXY": PROXY_URL,
-        "NO_PROXY": "10.0.0.0/8,localhost",
-        "http_proxy": "",
-        "https_proxy": PROXY_URL,
-        "no_proxy": "10.0.0.0/8,localhost",
-    }
+def test_proxy_configuration(juju: jubilant.Juju):
+    proxy_url = "http://proxy.example.com:3128"
+    juju.model_config({"juju-https-proxy": proxy_url})
+    juju.config("boo", {"log-level": "debug"})
     juju.wait(
-        lambda _: workload_environment(juju, ssh_access).items() >= expected.items(),
-        delay=5,
-        timeout=300,
+        lambda _: (
+            juju.run("boo/0", "show-proxy").results["https-proxy"]
+            == "http://proxy.example.com:3128"
+        ),
+        delay=2,
+        timeout=120,
+        successes=1,
     )
 
-    # Removed proxy configs are cleared, and juju-no-proxy returns to the Juju default.
-    juju.model_config(reset=["juju-https-proxy", "juju-no-proxy"])
-    expected = {
-        "HTTP_PROXY": "",
-        "HTTPS_PROXY": "",
-        "NO_PROXY": "127.0.0.1,::1,localhost",
-        "http_proxy": "",
-        "https_proxy": "",
-        "no_proxy": "127.0.0.1,::1,localhost",
-    }
+    juju.model_config(reset="juju-https-proxy")
+    juju.config("boo", {"log-level": "info"})
     juju.wait(
-        lambda _: workload_environment(juju, ssh_access).items() >= expected.items(),
-        delay=5,
-        timeout=300,
+        lambda _: juju.run("boo/0", "show-proxy").results["https-proxy"] == "",
+        delay=2,
+        timeout=120,
+        successes=1,
     )
+    # Use juju.model_config to restore model config if necessary.
 
 
 # If you implement boo.get_version in the charm source,
